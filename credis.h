@@ -1,6 +1,6 @@
 /* credis.h -- a C client library for Redis, public API.
  *
- * Copyright (c) 2009-2010, Jonas Romfelt <jonas at romfelt dot se>
+ * Copyright (c) 2009-2012, Jonas Romfelt <jonas at romfelt dot se>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -85,6 +85,7 @@ typedef struct _cr_redis* REDIS;
 #define CREDIS_ERR_RECV -95
 #define CREDIS_ERR_TIMEOUT -96
 #define CREDIS_ERR_PROTOCOL -97
+#define CREDIS_ERR_PUBSUB -98
 
 #define CREDIS_TYPE_NONE 1
 #define CREDIS_TYPE_STRING 2
@@ -128,6 +129,8 @@ typedef struct _cr_info {
   unsigned long hash_max_zipmap_value;
   long pubsub_channels;
   unsigned int pubsub_patterns;
+  long long keyspace_hits;
+  long long keyspace_misses;
   int vm_enabled;
   int role;
 } REDIS_INFO;
@@ -150,11 +153,13 @@ void credis_settimeout(REDIS rhnd, int timeout);
 
 void credis_close(REDIS rhnd);
 
-void credis_quit(REDIS rhnd);
+int credis_quit(REDIS rhnd);
 
 int credis_auth(REDIS rhnd, const char *password);
 
 int credis_ping(REDIS rhnd);
+
+int credis_echo(REDIS rhnd, const char *message, char **reply);
 
 /* if a function call returns error it is _possible_ that the Redis server
  * replied with an error message. It is returned by this function. */
@@ -213,6 +218,8 @@ int credis_flushall(REDIS rhnd);
 
 int credis_set(REDIS rhnd, const char *key, const char *val);
 
+int credis_setex(REDIS rhnd, const char *key, const char *val, int seconds);
+
 /* returns -1 if the key doesn't exists */
 int credis_get(REDIS rhnd, const char *key, char **val);
 
@@ -227,7 +234,6 @@ int credis_mget(REDIS rhnd, int keyc, const char **keyv, char ***valv);
 int credis_setnx(REDIS rhnd, const char *key, const char *val);
 
 /* TODO
- * SETEX key time value Set+Expire combo command
  * MSET key1 value1 key2 value2 ... keyN valueN set a multiple keys to multiple values in a single atomic operation
  * MSETNX key1 value1 key2 value2 ... keyN valueN set a multiple keys to multiple values in a single atomic operation if none of
  */
@@ -249,13 +255,21 @@ int credis_append(REDIS rhnd, const char *key, const char *val);
 
 int credis_substr(REDIS rhnd, const char *key, int start, int end, char **substr);
 
+/* is an alias for credis_substr(), the command SUBSTR was renamed to GETRANGE in Redis > 2.0
+ * but is automatically handled by credis */
+int credis_getrange(REDIS rhnd, const char *key, int start, int end, char **substr);
+
 
 /*
  * Commands operating on lists 
  */
 
+/* if Redis server version is 2.0 or later the number of elements inside the list 
+ * after the push operation is returned on success */
 int credis_rpush(REDIS rhnd, const char *key, const char *element);
 
+/* if Redis server version is 2.0 or later the number of elements inside the list 
+ * after the push operation is returned on success */
 int credis_lpush(REDIS rhnd, const char *key, const char *element);
 
 /* returns length of list */
@@ -350,8 +364,7 @@ int credis_zadd(REDIS rhnd, const char *key, double score, const char *member);
 /* returns -1 if the member was not a member of the sorted set */
 int credis_zrem(REDIS rhnd, const char *key, const char *member);
 
-/* returns -1 if the member was not a member of the sorted set, the score of the member after
- * the increment by `incr_score' is returned by `new_score' */
+/* the score of the member after the increment by `incr_score' is returned by `new_score' */
 int credis_zincrby(REDIS rhnd, const char *key, double incr_score, const char *member, double *new_score);
 
 /* returns the rank of the given member or -1 if the member was not a member of the sorted set */
@@ -363,6 +376,16 @@ int credis_zrevrank(REDIS rhnd, const char *key, const char *member);
 /* returns number of elements returned in vector `elementv' 
  * TODO add support for WITHSCORES */
 int credis_zrange(REDIS rhnd, const char *key, int start, int end, char ***elementv);
+
+/* returns number of elements returned in vector `elementv' 
+ * TODO add support for LIMIT 
+ * TODO add support for WITHSCORES */
+int credis_zrangebyscore(REDIS rhnd, const char *key, double min, double max, char ***elementv);
+
+/* returns number of elements returned in vector `elementv' 
+ * TODO add support for LIMIT 
+ * TODO add support for WITHSCORES */
+int credis_zrevrangebyscore(REDIS rhnd, const char *key, double max, double min, char ***elementv);
 
 /* returns number of elements returned in vector `elementv' 
  * TODO add support for WITHSCORES */
@@ -381,10 +404,6 @@ int credis_zremrangebyscore(REDIS rhnd, const char *key, double min, double max)
 /* returns number of elements removed or -1 if key does not exist */
 int credis_zremrangebyrank(REDIS rhnd, const char *key, int start, int end);
 
-/* TODO
- * ZRANGEBYSCORE key min max Return all the elements with score >= min and score <= max (a range query) from the sorted set
- */
-
 /* `keyc' is the number of keys stored in `keyv'. `weightv' is optional, if not 
  * NULL, `keyc' is also the number of weights stored in `weightv'. */
 int credis_zinterstore(REDIS rhnd, const char *destkey, int keyc, const char **keyv, 
@@ -399,15 +418,29 @@ int credis_zunionstore(REDIS rhnd, const char *destkey, int keyc, const char **k
  * Commands operating on hashes
  */
 
+/* 1 is returned if the field already exists and its value is updated, 0 is 
+ * returned if the field is created */
+int credis_hset(REDIS rhnd, const char *key, const char *field, const char *value);
+
+/* returns -1 if key or field don't exist */
+int credis_hget(REDIS rhnd, const char *key, const char *field, char **value);
+
+/* returns number of field names returned in vector `fieldv'. 0 is returned if `key' 
+ * is empty or does not exist */
+int credis_hkeys(REDIS rhnd, const char *key, char ***fieldv);
+
+/* returns number of fields in the hash, or 0 if `key' does not exist */
+int credis_hlen(REDIS rhnd, const char *key);
+ 
+/* returns number of values returned in vector `valv'. `fieldc' is the number
+ * of fields stored in `fieldv'. */
+int credis_hmget(REDIS rhnd, const char *key, int fieldc, const char **fieldv, char ***valv);
+
 /* TODO
- * HSET key field value Set the hash field to the specified value. Creates the hash if needed.
- * HGET key field Retrieve the value of the specified hash field.
  * HMSET key field1 value1 ... fieldN valueN Set the hash fields to their respective values.
  * HINCRBY key field integer Increment the integer value of the hash at _key_ on _field_ with _integer_.
  * HEXISTS key field Test for existence of a specified field in a hash
  * HDEL key field Remove the specified field from a hash
- * HLEN key Return the number of items in a hash.
- * HKEYS key Return all the fields in a hash.
  * HVALS key Return all the values in a hash.
  * HGETALL key Return all the fields and associated values in a hash.
  */
@@ -431,12 +464,51 @@ int credis_sort(REDIS rhnd, const char *query, char ***elementv);
 
 
 /*
- * Publish/Subscribe
+ * Publish/Subscribe 
+ *
+ * !!EXPERIMENTAL!! Expect API and implementation to change until these
+ * lines are removed.
+ *
+ * The nature of the publish/subscribe messaging paradigm differs from the 
+ * rest of Redis, the main difference being messages are pushed to subscribing 
+ * clients. Credis tries to hide some of this de-coupling in order to make life
+ * easier for application programmers. All subscribe, unsubscribe and publish 
+ * function calls will return when an acknowledgement has been received or on 
+ * error (including timeout), just as all other Credis function calls that map 
+ * to Redis commands. If a message is pushed to the client while waiting for 
+ * an acknowledgement, to for instance a new subscription, that message is 
+ * stored on an internal FIFO. When the client is ready to receive messages a 
+ * call to listen function is made and if there is a message in the FIFO it is 
+ * immediately returned else Credis waits for a message being pushed from Redis.
+ *
+ * IMPORTANT! Note that while subscribing to one or more channels (or patterns) 
+ * the client is in a publish/subscribe state in which is not allowed to perform 
+ * other commands.
  */
 
-/* TODO
- * SUBSCRIBE/UNSUBSCRIBE/PUBLISH Redis Public/Subscribe messaging paradigm implementation
- */
+/* On success the number of channels we are currently subscribed to is
+ * returned. */
+int credis_subscribe(REDIS rhnd, const char *channel);
+
+/* `channel' specifies the channel to unsubscribe from. If set to NULL
+ * all channels are unsubscribed from. On success the number of channels 
+ * we are currently subscribed to is returned. */
+int credis_unsubscribe(REDIS rhnd, const char *channel);
+
+/* On success the number of channels we are currently subscribed to is
+ * returned. */
+int credis_psubscribe(REDIS rhnd, const char *pattern);
+
+/* `pattern' specifies the channels to unsubscribe from. If set to NULL
+ * all are unsubscribed from. On success the number of channels we are 
+ * currently subscribed to is returned. */
+int credis_punsubscribe(REDIS rhnd, const char *pattern);
+
+/* On success the number of clients that received the message is returned */
+int credis_publish(REDIS rhnd, const char *channel, const char *message);
+
+/* Listen for messages from channels and/or patterns subscribed to */
+int credis_listen(REDIS rhnd, char **pattern, char **channel, char **message);
 
 
 /* 

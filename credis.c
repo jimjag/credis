@@ -1,6 +1,6 @@
 /* credis.c -- a C client library for Redis
  *
- * Copyright (c) 2009-2010, Jonas Romfelt <jonas at romfelt dot se>
+ * Copyright (c) 2009-2012, Jonas Romfelt <jonas at romfelt dot se>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -34,6 +34,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #else 
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#endif
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -59,11 +62,15 @@ void close(int fd) {
 }
 #endif
 
+#define CR_VERSION(x,y,z) ((x) * 10000 + (y) * 100 + (z))
+
 #define CR_ERROR '-'
 #define CR_INLINE '+'
 #define CR_BULK '$'
 #define CR_MULTIBULK '*'
 #define CR_INT ':'
+#define CR_ANY '?'
+#define CR_NONE ' '
 
 #define CR_BUFFER_SIZE 4096
 #define CR_BUFFER_WATERMARK ((CR_BUFFER_SIZE)/10+1)
@@ -108,18 +115,32 @@ typedef struct _cr_multibulk {
 } cr_multibulk;
 
 typedef struct _cr_reply {
+  char type;
   int integer;
   char *line;
   char *bulk;
   cr_multibulk multibulk;
 } cr_reply;
 
+typedef struct _cr_message { 
+  char *pattern;
+  char *channel;
+  char *message;
+  struct _cr_message *next; 
+} cr_message;
+
 typedef struct _cr_redis {
   struct {
     int major;
     int minor;
     int patch;
+    int number; /* holds a version number created by CR_VERSION() */
   } version;
+  struct {
+    cr_message *head;
+    cr_message *tail;
+    cr_message *msg;
+  } pubsub;
   int fd;
   char *ip;
   int port;
@@ -129,6 +150,7 @@ typedef struct _cr_redis {
   int error;
 } cr_redis;
 
+static void cr_freeallmessages(REDIS rhnd);
 
 /* Returns pointer to the '\r' of the first occurence of "\r\n", or NULL
  * if not found */
@@ -199,7 +221,7 @@ static int cr_morebulk(cr_multibulk *mb, int size)
  * Returns:
  *   0  on success
  *  <0  on error, i.e. more memory not available */
-static int cr_splitstrtromultibulk(REDIS rhnd, char *str, const char token)
+static int cr_splitstrtomultibulk(REDIS rhnd, char *str, const char token)
 {
   int i = 0;
 
@@ -224,6 +246,7 @@ static int cr_splitstrtromultibulk(REDIS rhnd, char *str, const char token)
  * Returns:
  *   0  on success
  *  <0  on error, i.e. more memory not available */
+__attribute__ ((format(printf,2,3)))
 static int cr_appendstrf(cr_buffer *buf, const char *format, ...)
 {
   int rc, avail;
@@ -235,16 +258,29 @@ static int cr_appendstrf(cr_buffer *buf, const char *format, ...)
   rc = vsnprintf(buf->data + buf->len, avail, format, ap);
   va_end(ap);
 
-  if (rc < 0)
+  if (rc < 0) {
+#ifdef WIN32
+    rc = avail * 2;
+#else
     return -1;
+#endif
+  }
 
-  if (rc >= avail) {
+  while (rc >= avail) {
     if (cr_moremem(buf, rc - avail + 1))
       return CREDIS_ERR_NOMEM;
 
     va_start(ap, format);
     rc = vsnprintf(buf->data + buf->len, buf->size - buf->len, format, ap);
     va_end(ap);
+
+    if (rc < 0) {
+#ifdef WIN32
+      rc = avail * 2;
+#else
+      return -1;
+#endif
+    }
   }
   buf->len += rc;
 
@@ -450,6 +486,7 @@ static int cr_readln(REDIS rhnd, int start, char **line, int *idx)
 static int cr_receivemultibulk(REDIS rhnd, char *line) 
 {
   int bnum, blen, i, rc=0, idx;
+  char type;
 
   bnum = atoi(line);
 
@@ -463,19 +500,24 @@ static int cr_receivemultibulk(REDIS rhnd, char *line)
       return CREDIS_ERR_NOMEM;
   }
 
-  for (i = 0; bnum > 0 && (rc = cr_readln(rhnd, 0, &line, NULL)) > 0; i++, bnum--) {
-    if (*(line++) != CR_BULK)
-      return CREDIS_ERR_PROTOCOL;
-    
-    blen = atoi(line);
-    if (blen == -1)
-      rhnd->reply.multibulk.idxs[i] = -1;
-    else {
-      if ((rc = cr_readln(rhnd, blen, &line, &idx)) != blen)
-        return CREDIS_ERR_PROTOCOL;
-
-      rhnd->reply.multibulk.idxs[i] = idx;
+  for (i = 0; bnum > 0 && (rc = cr_readln(rhnd, 0, &line, &idx)) > 0; i++, bnum--) {
+    type = *(line++);
+    if (type == CR_BULK) {
+      blen = atoi(line);
+      if (blen == -1)
+        rhnd->reply.multibulk.idxs[i] = -1;
+      else {
+        if ((rc = cr_readln(rhnd, blen, &line, &idx)) != blen)
+          return CREDIS_ERR_PROTOCOL;
+        
+        rhnd->reply.multibulk.idxs[i] = idx;
+      }
     }
+    else if (type == CR_INT) {
+      rhnd->reply.multibulk.idxs[i] = idx + 1;
+    }
+    else
+      return CREDIS_ERR_PROTOCOL;
   }
   
   if (bnum != 0) {
@@ -540,8 +582,10 @@ static int cr_receivereply(REDIS rhnd, char recvtype)
   if (cr_readln(rhnd, 0, &line, NULL) > 0) {
     prefix = *(line++);
  
-    if (prefix != recvtype && prefix != CR_ERROR)
+    if (recvtype != CR_ANY && prefix != recvtype && prefix != CR_ERROR)
       return CREDIS_ERR_PROTOCOL;
+
+    rhnd->reply.type = prefix;
 
     switch(prefix) {
     case CR_ERROR:
@@ -562,6 +606,7 @@ static int cr_receivereply(REDIS rhnd, char recvtype)
 
 static void cr_delete(REDIS rhnd) 
 {
+  cr_freeallmessages(rhnd);
   if (rhnd->reply.multibulk.bulks != NULL)
     free(rhnd->reply.multibulk.bulks);
   if (rhnd->reply.multibulk.idxs != NULL)
@@ -609,7 +654,10 @@ static int cr_sendandreceive(REDIS rhnd, char recvtype)
     return CREDIS_ERR_TIMEOUT;
   }
 
-  return cr_receivereply(rhnd, recvtype);
+  if (recvtype != CR_NONE)
+    rc = cr_receivereply(rhnd, recvtype);
+
+  return rc;
 }
 
 /* Prepare message buffer for sending using a printf()-style formatting. */
@@ -624,10 +672,16 @@ static int cr_sendfandreceive(REDIS rhnd, char recvtype, const char *format, ...
   rc = vsnprintf(buf->data, buf->size, format, ap);
   va_end(ap);
 
-  if (rc < 0)
+  if (rc < 0) {
+#ifdef WIN32
+    /* handle the fact that vnsprintf() returns -1 if the buffer is too small */
+    rc = buf->size * 2;
+#else
     return -1;
+#endif
+  }
 
-  if (rc >= buf->size) {
+  while (rc >= buf->size) {
     DEBUG("truncated, get more memory and try again");
     if (cr_moremem(buf, rc - buf->size + 1))
       return CREDIS_ERR_NOMEM;
@@ -635,6 +689,14 @@ static int cr_sendfandreceive(REDIS rhnd, char recvtype, const char *format, ...
     va_start(ap, format);
     rc = vsnprintf(buf->data, buf->size, format, ap);
     va_end(ap);
+
+    if (rc < 0) {
+#ifdef WIN32
+      rc = buf->size * 2;
+#else
+      return -1;
+#endif
+    }
   }
 
   buf->len = rc;
@@ -659,11 +721,37 @@ void credis_close(REDIS rhnd)
   }
 }
 
+/* Requests Redis server information and tries to fill handle with server version 
+ * information */ 
+static int cr_getredisversion(REDIS rhnd)
+{
+  /* We can receive 2 version formats: x.yz and x.y.z, where x.yz was only used prior 
+   * first 1.1.0 release(?), e.g. stable releases 1.02 and 1.2.6 */
+  /* TODO check returned error string, "-ERR operation not permitted", to detect if 
+   * server require password? */
+  if (cr_sendfandreceive(rhnd, CR_BULK, "INFO\r\n") == 0) {
+    int items = sscanf(rhnd->reply.bulk,
+                       "redis_version:%d.%d.%d\r\n",
+                       &(rhnd->version.major),
+                       &(rhnd->version.minor),
+                       &(rhnd->version.patch));
+    if (items == 2) {
+      rhnd->version.patch = rhnd->version.minor;
+      rhnd->version.minor = 0;
+    }
+    DEBUG("Connected to Redis version: %d.%d.%d\n", 
+          rhnd->version.major, rhnd->version.minor, rhnd->version.patch);
+
+    rhnd->version.number = CR_VERSION(rhnd->version.major, rhnd->version.minor, rhnd->version.patch);
+  }
+
+  return 0;
+}
+
 REDIS credis_connect(const char *host, int port, int timeout)
 {
-  int fd, rc, flags, yes = 1, use_he = 0;
+  int fd, rc, flags, yes = 1;
   struct sockaddr_in sa;  
-  struct hostent *he;
   REDIS rhnd;
 
 #ifdef WIN32
@@ -700,28 +788,34 @@ REDIS credis_connect(const char *host, int port, int timeout)
   sa.sin_port = htons(port);
 
 #ifdef WIN32
+  struct hostent *he;
+
   /* TODO use getaddrinfo() instead! */
   addr = inet_addr(host);
-  if (addr == INADDR_NONE) {
+  if (addr == INADDR_NONE)
     he = gethostbyname(host);
-    use_he = 1;
-  }
-  else {
+  else
     he = gethostbyaddr((char *)&addr, sizeof(addr), AF_INET);
-    use_he = 1;
-  }
+
+  if (he == NULL)
+    goto error;
+
+  memcpy(&sa.sin_addr, he->h_addr, sizeof(struct in_addr));
 #else
+  int err;
+  struct addrinfo hints, *info;
+ 
   if (inet_aton(host, &sa.sin_addr) == 0) {
-    he = gethostbyname(host);
-    use_he = 1;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    err = getaddrinfo(host, NULL, &hints, &info);
+    if (err)
+      DEBUG("getaddrinfo error: %s\n", gai_strerror(err));
+    memcpy(&sa.sin_addr.s_addr, &(info->ai_addr->sa_data[2]), sizeof(in_addr_t));
+    freeaddrinfo(info);
   }
 #endif
-
-  if (use_he) {
-    if (he == NULL)
-      goto error;
-    memcpy(&sa.sin_addr, he->h_addr, sizeof(struct in_addr));
-  } 
 
   /* connect with user specified timeout */
 
@@ -750,23 +844,8 @@ REDIS credis_connect(const char *host, int port, int timeout)
   rhnd->fd = fd;
   rhnd->timeout = timeout;
 
-  /* We can receive 2 version formats: x.yz and x.y.z, where x.yz was only used prior 
-   * first 1.1.0 release(?), e.g. stable releases 1.02 and 1.2.6 */
-  if (cr_sendfandreceive(rhnd, CR_BULK, "INFO\r\n") == 0) {
-    int items = sscanf(rhnd->reply.bulk,
-                       "redis_version:%d.%d.%d\r\n",
-                       &(rhnd->version.major),
-                       &(rhnd->version.minor),
-                       &(rhnd->version.patch));
-    if (items < 2)
-      goto error;
-    if (items == 2) {
-      rhnd->version.patch = rhnd->version.minor;
-      rhnd->version.minor = 0;
-    }
-    DEBUG("Connected to Redis version: %d.%d.%d\n", 
-          rhnd->version.major, rhnd->version.minor, rhnd->version.patch);
-  }
+  if (cr_getredisversion(rhnd) != 0)
+    goto error;
 
   return rhnd;
 
@@ -774,7 +853,6 @@ error:
   if (fd > 0)
     close(fd);
   cr_delete(rhnd);
-
   return NULL;
 }
 
@@ -785,8 +863,22 @@ void credis_settimeout(REDIS rhnd, int timeout)
 
 int credis_set(REDIS rhnd, const char *key, const char *val)
 {
-  return cr_sendfandreceive(rhnd, CR_INLINE, "SET %s %zu\r\n%s\r\n", 
-                            key, strlen(val), val);
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    return cr_sendfandreceive(rhnd, CR_INLINE, "SET %s %s\r\n", 
+			      key, val);
+  else
+    return cr_sendfandreceive(rhnd, CR_INLINE, "SET %s %zu\r\n%s\r\n", 
+			      key, strlen(val), val);
+}
+
+int credis_setex(REDIS rhnd, const char *key, const char *val, int seconds)
+{
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    return cr_sendfandreceive(rhnd, CR_INLINE, "SETEX %s %d %s\r\n",
+			      key, seconds, val);
+  else
+    return cr_sendfandreceive(rhnd, CR_INLINE, "SETEX %s %d %zu\r\n%s\r\n",
+			      key, seconds, strlen(val), val);
 }
 
 int credis_get(REDIS rhnd, const char *key, char **val)
@@ -801,9 +893,15 @@ int credis_get(REDIS rhnd, const char *key, char **val)
 
 int credis_getset(REDIS rhnd, const char *key, const char *set_val, char **get_val)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_BULK, "GETSET %s %zu\r\n%s\r\n", 
-                              key, strlen(set_val), set_val);
+  int rc;
 
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "GETSET %s %s\r\n", 
+			    key, set_val);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "GETSET %s %zu\r\n%s\r\n", 
+			    key, strlen(set_val), set_val);
+  
   if (rc == 0 && (*get_val = rhnd->reply.bulk) == NULL)
     return -1;
 
@@ -815,9 +913,37 @@ int credis_ping(REDIS rhnd)
   return cr_sendfandreceive(rhnd, CR_INLINE, "PING\r\n");
 }
 
+int credis_echo(REDIS rhnd, const char *message, char **reply)
+{
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "ECHO %s\r\n", 
+			    message);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "ECHO %zu\r\n%s\r\n", 
+			    strlen(message), message);
+  
+  if (rc == 0 && (*reply = rhnd->reply.bulk) == NULL)
+    return -1;
+
+  return rc;
+}
+
+int credis_quit(REDIS rhnd) 
+{
+  return cr_sendfandreceive(rhnd, CR_INLINE, "QUIT\r\n");
+}
+
 int credis_auth(REDIS rhnd, const char *password)
 {
-  return cr_sendfandreceive(rhnd, CR_INLINE, "AUTH %s\r\n", password);
+  int rc = cr_sendfandreceive(rhnd, CR_INLINE, "AUTH %s\r\n", password);
+
+  /* Request Redis server version once we have been authenticated */
+  if (rc == 0)
+    return cr_getredisversion(rhnd);
+
+  return rc;
 }
 
 static int cr_multikeybulkcommand(REDIS rhnd, const char *cmd, int keyc, 
@@ -853,7 +979,11 @@ static int cr_multikeystorecommand(REDIS rhnd, const char *cmd, const char *dest
   if ((rc = cr_appendstrarray(buf, keyc, keyv, 1)) != 0)
     return rc;
 
-  return cr_sendandreceive(rhnd, CR_INLINE);
+  /* integer reply and not inline as documentation specifies */
+  if ((rc = cr_sendandreceive(rhnd, CR_INT)) == 0)
+    rc = rhnd->reply.integer;
+
+  return rc;
 }
 
 int credis_mget(REDIS rhnd, int keyc, const char **keyv, char ***valv)
@@ -863,8 +993,14 @@ int credis_mget(REDIS rhnd, int keyc, const char **keyv, char ***valv)
 
 int credis_setnx(REDIS rhnd, const char *key, const char *val)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_INT, "SETNX %s %zu\r\n%s\r\n", 
-                              key, strlen(val), val);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "SETNX %s %s\r\n", 
+			    key, val);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_INT, "SETNX %s %zu\r\n%s\r\n", 
+			    key, strlen(val), val);
 
   if (rc == 0 && rhnd->reply.integer == 0)
     rc = -1;
@@ -911,8 +1047,14 @@ int credis_decrby(REDIS rhnd, const char *key, int decr_val, int *new_val)
 
 int credis_append(REDIS rhnd, const char *key, const char *val)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_INT, "APPEND %s %zu\r\n%s\r\n", 
-                              key, strlen(val), val);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "APPEND %s %s\r\n", 
+			    key, val);
+  else 
+    rc = cr_sendfandreceive(rhnd, CR_INT, "APPEND %s %zu\r\n%s\r\n", 
+			    key, strlen(val), val);
                             
   if (rc == 0)
     rc = rhnd->reply.integer;
@@ -922,13 +1064,24 @@ int credis_append(REDIS rhnd, const char *key, const char *val)
 
 int credis_substr(REDIS rhnd, const char *key, int start, int end, char **substr)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_BULK, "SUBSTR %s %d %d\r\n", 
-                              key, start, end);
+  int rc;
+
+  if (rhnd->version.number <= CR_VERSION(2,0,0))
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "SUBSTR %s %d %d\r\n", 
+			    key, start, end);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "GETRANGE %s %d %d\r\n", 
+			    key, start, end);
 
   if (rc == 0 && substr) 
     *substr = rhnd->reply.bulk;
 
   return rc;                            
+}
+
+int credis_getrange(REDIS rhnd, const char *key, int start, int end, char **substr)
+{
+  return credis_substr(rhnd, key, start, end, substr);
 }
 
 int credis_exists(REDIS rhnd, const char *key)
@@ -972,15 +1125,23 @@ int credis_type(REDIS rhnd, const char *key)
 
 int credis_keys(REDIS rhnd, const char *pattern, char ***keyv)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_BULK, "KEYS %s\r\n", pattern);
+  int rc;
+
+  /* with Redis 2.0.0 keys-command returns a multibulk instead of bulk */
+  if (rhnd->version.number >= CR_VERSION(2,0,0)) {
+    rc = cr_sendfandreceive(rhnd, CR_MULTIBULK, "KEYS %s\r\n", pattern);
+  }
+  else {
+    if ((rc = cr_sendfandreceive(rhnd, CR_BULK, "KEYS %s\r\n", pattern)) == 0) {
+      /* server returns keys as space-separated strings, use multi-bulk 
+       * storage to store keys */
+      rc = cr_splitstrtomultibulk(rhnd, rhnd->reply.bulk, ' ');
+    }
+  }
 
   if (rc == 0) {
-    /* server returns keys as space-separated strings, use multi-bulk 
-     * storage to store keys */
-    if ((rc = cr_splitstrtromultibulk(rhnd, rhnd->reply.bulk, ' ')) == 0) {
-      *keyv = rhnd->reply.multibulk.bulks;
-      rc = rhnd->reply.multibulk.len;
-    }
+    *keyv = rhnd->reply.multibulk.bulks;
+    rc = rhnd->reply.multibulk.len;
   }
 
   return rc;
@@ -988,10 +1149,21 @@ int credis_keys(REDIS rhnd, const char *pattern, char ***keyv)
 
 int credis_randomkey(REDIS rhnd, char **key)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_INLINE, "RANDOMKEY\r\n");
+  int rc;
 
-  if (rc == 0 && key) 
-    *key = rhnd->reply.line;
+  /* with Redis 2.0.0 randomkey-command returns a bulk instead of inline */
+  if (rhnd->version.number >= CR_VERSION(2,0,0)) {
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "RANDOMKEY\r\n");
+
+    if (rc == 0 && key) 
+      *key = rhnd->reply.bulk;
+  }
+  else {
+    rc = cr_sendfandreceive(rhnd, CR_INLINE, "RANDOMKEY\r\n");
+
+    if (rc == 0 && key) 
+      *key = rhnd->reply.line;
+  }
 
   return rc;
 }
@@ -1045,8 +1217,27 @@ int credis_ttl(REDIS rhnd, const char *key)
 
 static int cr_push(REDIS rhnd, int left, const char *key, const char *val)
 {
-  return cr_sendfandreceive(rhnd, CR_INLINE, "%s %s %zu\r\n%s\r\n", 
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,0,0)) {
+    if (rhnd->version.number >= CR_VERSION(2,2,2)) {
+      rc = cr_sendfandreceive(rhnd, CR_INT, "%s %s %s\r\n", 
+			      left==1?"LPUSH":"RPUSH", key, val);
+    }
+    else {
+      rc = cr_sendfandreceive(rhnd, CR_INT, "%s %s %zu\r\n%s\r\n", 
+			      left==1?"LPUSH":"RPUSH", key, strlen(val), val);
+    }
+
+    if (rc == 0)
+      rc = rhnd->reply.integer;
+  }
+  else {
+    rc = cr_sendfandreceive(rhnd, CR_INLINE, "%s %s %zu\r\n%s\r\n", 
                             left==1?"LPUSH":"RPUSH", key, strlen(val), val);
+  }
+
+  return rc;
 }
 
 int credis_rpush(REDIS rhnd, const char *key, const char *val)
@@ -1100,14 +1291,29 @@ int credis_lindex(REDIS rhnd, const char *key, int index, char **val)
 
 int credis_lset(REDIS rhnd, const char *key, int index, const char *val)
 {
-  return cr_sendfandreceive(rhnd, CR_INLINE, "LSET %s %d %zu\r\n%s\r\n", 
-                            key, index, strlen(val), val);
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    return cr_sendfandreceive(rhnd, CR_INLINE, "LSET %s %d %s\r\n", 
+			      key, index, val);
+  else
+    return cr_sendfandreceive(rhnd, CR_INLINE, "LSET %s %d %zu\r\n%s\r\n", 
+			      key, index, strlen(val), val);
 }
 
 int credis_lrem(REDIS rhnd, const char *key, int count, const char *val)
 {
-  return cr_sendfandreceive(rhnd, CR_INT, "LREM %s %d %zu\r\n%s\r\n", 
-                            key, count, strlen(val), val);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "LREM %s %d %s\r\n", 
+			    key, count, val);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_INT, "LREM %s %d %zu\r\n%s\r\n", 
+			    key, count, strlen(val), val);
+
+  if (rc == 0) 
+    rc = rhnd->reply.integer;
+
+  return rc;
 }
 
 static int cr_pop(REDIS rhnd, int left, const char *key, char **val)
@@ -1239,6 +1445,8 @@ int credis_info(REDIS rhnd, REDIS_INFO *info)
     cr_parseinfo(rhnd->reply.bulk, "hash_max_zipmap_value", "%zu", &(info->hash_max_zipmap_value));
     cr_parseinfo(rhnd->reply.bulk, "pubsub_channels", "%ld", &(info->pubsub_channels));
     cr_parseinfo(rhnd->reply.bulk, "pubsub_patterns", "%u", &(info->pubsub_patterns));
+    cr_parseinfo(rhnd->reply.bulk, "keyspace_hits", "%lld", &(info->keyspace_hits));
+    cr_parseinfo(rhnd->reply.bulk, "keyspace_misses", "%lld", &(info->keyspace_misses));
     cr_parseinfo(rhnd->reply.bulk, "vm_enabled", "%d", &(info->vm_enabled));
     cr_parseinfo(rhnd->reply.bulk, "role", "%c", &role);
 
@@ -1263,9 +1471,15 @@ int credis_slaveof(REDIS rhnd, const char *host, int port)
 
 static int cr_setaddrem(REDIS rhnd, const char *cmd, const char *key, const char *member)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_INT, "%s %s %zu\r\n%s\r\n", 
-                              cmd, key, strlen(member), member);
+  int rc;
 
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "%s %s %s\r\n", 
+			    cmd, key, member);
+  else      
+    rc = cr_sendfandreceive(rhnd, CR_INT, "%s %s %zu\r\n%s\r\n", 
+			    cmd, key, strlen(member), member);
+  
   if (rc == 0 && rhnd->reply.integer == 0)
     rc = -1;
 
@@ -1295,8 +1509,14 @@ int credis_spop(REDIS rhnd, const char *key, char **member)
 int credis_smove(REDIS rhnd, const char *sourcekey, const char *destkey, 
                  const char *member)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_INT, "SMOVE %s %s %s\r\n", 
-                              sourcekey, destkey, member);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "SMOVE %s %s %s\r\n",  
+			    sourcekey, destkey, member);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_INT, "SMOVE %s %s %zu\r\n%s\r\n",  
+			    sourcekey, destkey, strlen(member), member);
 
   if (rc == 0 && rhnd->reply.integer == 0)
     rc = -1;
@@ -1356,8 +1576,14 @@ int credis_smembers(REDIS rhnd, const char *key, char ***members)
 
 int credis_zadd(REDIS rhnd, const char *key, double score, const char *member)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_INT, "ZADD %s %f %zu\r\n%s\r\n", 
-                              key, score, strlen(member), member);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "ZADD %s %f %s\r\n", 
+			    key, score, member);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_INT, "ZADD %s %f %zu\r\n%s\r\n", 
+			    key, score, strlen(member), member);
 
   if (rc == 0 && rhnd->reply.integer == 0)
     rc = -1;
@@ -1367,8 +1593,14 @@ int credis_zadd(REDIS rhnd, const char *key, double score, const char *member)
 
 int credis_zrem(REDIS rhnd, const char *key, const char *member)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_INT, "ZREM %s %zu\r\n%s\r\n", 
-                              key, strlen(member), member);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "ZREM %s %s\r\n", 
+			    key, member);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_INT, "ZREM %s %zu\r\n%s\r\n", 
+			    key, strlen(member), member);
 
   if (rc == 0 && rhnd->reply.integer == 0)
     rc = -1;
@@ -1379,8 +1611,14 @@ int credis_zrem(REDIS rhnd, const char *key, const char *member)
 /* TODO what does Redis return if member is not member of set? */
 int credis_zincrby(REDIS rhnd, const char *key, double incr_score, const char *member, double *new_score)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_BULK, "ZINCRBY %s %f %zu\r\n%s\r\n", 
-                              key, incr_score, strlen(member), member);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "ZINCRBY %s %f %s\r\n", 
+			    key, incr_score, member);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "ZINCRBY %s %f %zu\r\n%s\r\n", 
+			    key, incr_score, strlen(member), member);
 
   if (rc == 0 && new_score)
     *new_score = strtod(rhnd->reply.bulk, NULL);
@@ -1388,14 +1626,23 @@ int credis_zincrby(REDIS rhnd, const char *key, double incr_score, const char *m
   return rc;
 }
 
-/* TODO what does Redis return if member is not member of set? */
 static int cr_zrank(REDIS rhnd, int reverse, const char *key, const char *member)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_BULK, "%s %s %zu\r\n%s\r\n", 
-                              reverse==1?"ZREVRANK":"ZRANK", key, strlen(member), member);
+  int rc;
 
-  if (rc == 0)
-    rc = atoi(rhnd->reply.bulk);
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_ANY, "%s %s %s\r\n", 
+			    reverse==1?"ZREVRANK":"ZRANK", key, member);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_ANY, "%s %s %zu\r\n%s\r\n", 
+			    reverse==1?"ZREVRANK":"ZRANK", key, strlen(member), member);
+
+  if (rc == 0) {
+    if (rhnd->reply.type == CR_INT)
+      rc = rhnd->reply.integer;
+    else
+      rc = -1;
+  }
 
   return rc;
 }
@@ -1433,6 +1680,29 @@ int credis_zrevrange(REDIS rhnd, const char *key, int start, int end, char ***el
   return cr_zrange(rhnd, 1, key, start, end, elementv);
 }
 
+int cr_zrangebyscore(REDIS rhnd, int reverse, const char *key, double a, double b, char ***elementv)
+{
+  int rc = cr_sendfandreceive(rhnd, CR_MULTIBULK, "%s %s %f %f\r\n",
+                              reverse==1?"ZREVRANGEBYSCORE":"ZRANGEBYSCORE", key, a, b);
+
+  if (rc == 0) {
+    *elementv = rhnd->reply.multibulk.bulks;
+    rc = rhnd->reply.multibulk.len;
+  }
+
+  return rc;
+}
+
+int credis_zrangebyscore(REDIS rhnd, const char *key, double min, double max, char ***elementv)
+{
+  return cr_zrangebyscore(rhnd, 0, key, min, max, elementv);
+}
+
+int credis_zrevrangebyscore(REDIS rhnd, const char *key, double max, double min, char ***elementv)
+{
+  return cr_zrangebyscore(rhnd, 1, key, max, min, elementv);
+}
+
 int credis_zcard(REDIS rhnd, const char *key)
 {
   int rc = cr_sendfandreceive(rhnd, CR_INT, "ZCARD %s\r\n", key);
@@ -1449,8 +1719,14 @@ int credis_zcard(REDIS rhnd, const char *key)
 
 int credis_zscore(REDIS rhnd, const char *key, const char *member, double *score)
 {
-  int rc = cr_sendfandreceive(rhnd, CR_BULK, "ZSCORE %s %zu\r\n%s\r\n", 
-                              key, strlen(member), member);
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "ZSCORE %s %s\r\n", 
+			    key, member);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "ZSCORE %s %zu\r\n%s\r\n", 
+			    key, strlen(member), member);
 
   if (rc == 0) {
     if (!rhnd->reply.bulk)
@@ -1494,7 +1770,7 @@ static int cr_zstore(REDIS rhnd, int inter, const char *destkey, int keyc, const
 
   buf->len = 0;
   
-  if ((rc = cr_appendstrf(buf, "%s %s %d ", inter?"ZINTERSTORE":"ZUNIONSTORE", destkey, keyc)) != 0)
+  if ((rc = cr_appendstrf(buf, "%s %s %d", inter?"ZINTERSTORE":"ZUNIONSTORE", destkey, keyc)) != 0)
     return rc;
   if ((rc = cr_appendstrarray(buf, keyc, keyv, 0)) != 0)
     return rc;
@@ -1505,13 +1781,13 @@ static int cr_zstore(REDIS rhnd, int inter, const char *destkey, int keyc, const
 
   switch (aggregate) {
   case SUM: 
-    rc = cr_appendstr(buf, "AGGREGATE SUM", 0);
+    rc = cr_appendstr(buf, " AGGREGATE SUM", 0);
     break;
   case MIN:
-    rc = cr_appendstr(buf, "AGGREGATE MIN", 0);
+    rc = cr_appendstr(buf, " AGGREGATE MIN", 0);
     break;
   case MAX:
-    rc = cr_appendstr(buf, "AGGREGATE MAX", 0);
+    rc = cr_appendstr(buf, " AGGREGATE MAX", 0);
     break;
   case NONE:
     ; /* avoiding compiler warning */
@@ -1539,3 +1815,280 @@ int credis_zunionstore(REDIS rhnd, const char *destkey, int keyc, const char **k
 {
   return cr_zstore(rhnd, 0, destkey, keyc, keyv, weightv, aggregate);
 }
+
+int credis_hset(REDIS rhnd, const char *key, const char *field, const char *value)
+{
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "HSET %s %s %s\r\n",
+			    key, field, value);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_INT, "HSET %s %s %zu\r\n%s\r\n", 
+			    key, field, strlen(value), value);
+
+  if (rc == 0 && rhnd->reply.integer == 0)
+    rc = -1;
+
+  return rc;
+}
+
+int credis_hget(REDIS rhnd, const char *key, const char *field, char **value)
+{
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "HGET %s %s\r\n",
+			    key, field);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_BULK, "HGET %s %zu\r\n%s\r\n", 
+			    key, strlen(field), field);
+
+  if (rc == 0 && (*value = rhnd->reply.bulk) == NULL)
+    return -1;
+
+  return rc;
+}
+
+int credis_hkeys(REDIS rhnd, const char *key, char ***fieldv)
+{
+  int rc = cr_sendfandreceive(rhnd, CR_MULTIBULK, "HKEYS %s\r\n", key);
+
+  if (rc == 0) {
+    rc = rhnd->reply.multibulk.len;
+    *fieldv = rhnd->reply.multibulk.bulks;
+  }
+
+  return rc;
+}
+
+int credis_hlen(REDIS rhnd, const char *key)
+{
+  int rc = cr_sendfandreceive(rhnd, CR_INT, "HLEN %s\r\n", key);
+
+  if (rc == 0)
+    rc = rhnd->reply.integer;
+
+  return rc;
+}
+
+int credis_hmget(REDIS rhnd, const char *key, int fieldc, const char **fieldv, char ***valv)
+{
+  cr_buffer *buf = &(rhnd->buf);
+  int rc, i;
+
+  buf->len = 0;
+
+  /* using the new unified request protocol */
+  rc = cr_appendstrf(buf, "*%i\r\n$5\r\nHMGET\r\n$%zu\r\n%s\r\n", fieldc + 2, strlen(key), key);
+  if (rc != 0)
+    return rc;
+  
+  /* add fields */
+  for (i = 0; i < fieldc; i++) {
+    if ((rc = cr_appendstrf(buf, "$%zu\r\n%s\r\n", strlen(fieldv[i]), fieldv[i])) != 0)
+      return rc;
+  }
+
+  if ((rc = cr_sendandreceive(rhnd, CR_MULTIBULK)) == 0) {
+    *valv = rhnd->reply.multibulk.bulks;
+    rc = rhnd->reply.multibulk.len;
+  }
+
+  return rc;
+}
+
+
+static void cr_freemessage(cr_message *msg)
+{
+  if (msg != NULL) {
+    if (msg->message != NULL)
+      free(msg->message);
+    if (msg->channel != NULL)
+      free(msg->channel);
+    if (msg->pattern != NULL)
+      free(msg->pattern);
+    free(msg);
+  }
+}
+
+/* returns first message in FIFO and removes it from queue but
+ * does not free memory. returns NULL if the queue is empty */
+static cr_message * cr_getmessage(REDIS rhnd)
+{
+  cr_message *msg = rhnd->pubsub.head;
+
+  if (rhnd->pubsub.head != NULL) {
+    if (rhnd->pubsub.head == rhnd->pubsub.tail) {
+      rhnd->pubsub.head = NULL;
+      rhnd->pubsub.tail = NULL;
+    }
+    else
+      rhnd->pubsub.head = rhnd->pubsub.head->next;
+  }
+
+  return msg;
+}
+
+static void cr_freeallmessages(REDIS rhnd)
+{
+  cr_message *msg;
+
+  if (rhnd->pubsub.msg != NULL) {
+    cr_freemessage(rhnd->pubsub.msg);
+    rhnd->pubsub.msg = NULL;
+  }
+
+  while ((msg = cr_getmessage(rhnd)) != NULL)
+    cr_freemessage(rhnd->pubsub.msg);
+}
+
+/* allocates and adds new message last in FIFO. if successful a 
+ * pointer to newly created message struct is returned else NULL 
+ * is returned. */
+static cr_message * cr_storemessage(REDIS rhnd, char *pattern, char *channel, char *message)
+{
+  cr_message *msg;
+
+  if ((msg = calloc(sizeof(cr_message), 1)) == NULL ||
+      (pattern != NULL && (msg->pattern = strdup(pattern)) == NULL) ||
+      (msg->channel = strdup(channel)) == NULL ||
+      (msg->message = strdup(message)) == NULL) {
+    DEBUG("out of memory\n");
+    cr_freemessage(msg);
+    return NULL;
+  }
+
+  if (rhnd->pubsub.tail != NULL)
+    rhnd->pubsub.tail->next = msg;
+
+  rhnd->pubsub.tail = msg;
+
+  if (rhnd->pubsub.head == NULL)
+    rhnd->pubsub.head = msg;
+  
+  return msg;
+}
+
+static int cr_parsepubsubmessage(REDIS rhnd, char **pattern, char **channel, char **message)
+{
+  if (rhnd->reply.multibulk.len >= 4 && 
+      !strcmp("pmessage", rhnd->reply.multibulk.bulks[0])) {
+    *pattern = rhnd->reply.multibulk.bulks[1];
+    *channel = rhnd->reply.multibulk.bulks[2];
+    *message = rhnd->reply.multibulk.bulks[3];
+  }
+  else if (rhnd->reply.multibulk.len >= 3 && 
+           !strcmp("message", rhnd->reply.multibulk.bulks[0])) {
+    *pattern = NULL;
+    *channel = rhnd->reply.multibulk.bulks[1];
+    *message = rhnd->reply.multibulk.bulks[2];
+  }
+  else
+    return CREDIS_ERR_PROTOCOL;
+
+  return 0;
+}
+
+/* wait for a specific pub/sub message, for instance the reply to an
+ * subscription request, and store (p)messages received during wait to
+ * message queue. returns number of channels/patterns subscribed to. */
+static int cr_sendandwaitforpubsub(REDIS rhnd, const char *command, const char *data)
+{
+  cr_buffer *buf = &(rhnd->buf);
+  char *pattern, *channel, *message;
+  int rc;
+
+  buf->len = 0;
+  
+  if (data != NULL)
+    rc = cr_appendstrf(buf, "%s %s\r\n", command, data);
+  else
+    rc = cr_appendstrf(buf, "%s\r\n", command);
+
+  /* send without receiving reply */
+  if (rc == 0)
+    rc = cr_sendandreceive(rhnd, CR_NONE);
+
+  /* wait for pushed messages */
+  /* TODO introduce a timeout */ 
+  while (rc == 0) {
+    if ((rc = cr_receivereply(rhnd, CR_MULTIBULK)) != 0)
+      return rc;
+
+    if (rhnd->reply.multibulk.len >= 3 && 
+        !strcasecmp(command, rhnd->reply.multibulk.bulks[0]) &&
+        !strcasecmp(data, rhnd->reply.multibulk.bulks[1])) {
+      return atoi(rhnd->reply.multibulk.bulks[2]);
+    }
+    else if (cr_parsepubsubmessage(rhnd, &pattern, &channel, &message) == 0) {
+      if (cr_storemessage(rhnd, pattern, channel, message) == NULL)
+        return CREDIS_ERR_NOMEM;
+    }
+    else
+      ; /* TODO out of order pub/sub message, return error or silently ignore? */
+  }
+
+  return rc;
+}
+
+int credis_subscribe(REDIS rhnd, const char *channel)
+{
+  return cr_sendandwaitforpubsub(rhnd, "SUBSCRIBE", channel);
+}
+
+int credis_unsubscribe(REDIS rhnd, const char *channel)
+{
+  return cr_sendandwaitforpubsub(rhnd, "UNSUBSCRIBE", channel);
+}
+
+int credis_psubscribe(REDIS rhnd, const char *pattern)
+{
+  return cr_sendandwaitforpubsub(rhnd, "PSUBSCRIBE", pattern);
+}
+
+int credis_punsubscribe(REDIS rhnd, const char *pattern)
+{
+  return cr_sendandwaitforpubsub(rhnd, "PUNSUBSCRIBE", pattern);
+}
+
+int credis_publish(REDIS rhnd, const char *channel, const char *message)
+{
+  int rc;
+
+  if (rhnd->version.number >= CR_VERSION(2,2,2))
+    rc = cr_sendfandreceive(rhnd, CR_INT, "PUBLISH %s %s\r\n", 
+			    channel, message);
+  else
+    rc = cr_sendfandreceive(rhnd, CR_INT, "PUBLISH %s %zu\r\n%s\r\n", 
+			    channel, strlen(message), message);
+
+  if (rc == 0)
+    rc = rhnd->reply.integer;
+
+  return rc;                            
+}
+
+int credis_listen(REDIS rhnd, char **pattern, char **channel, char **message)
+{
+  int rc;
+
+  if (rhnd->pubsub.msg != NULL)
+    cr_freemessage(rhnd->pubsub.msg);
+
+  /* check message queue first */
+  if ((rhnd->pubsub.msg = cr_getmessage(rhnd)) != NULL) {
+    *pattern = rhnd->pubsub.msg->pattern;
+    *channel = rhnd->pubsub.msg->channel;
+    *message = rhnd->pubsub.msg->message;
+    return 0;
+  }
+
+  /* wait for message */
+  if ((rc = cr_receivereply(rhnd, CR_MULTIBULK)) == 0)
+    rc = cr_parsepubsubmessage(rhnd, pattern, channel, message);
+
+  return rc;
+}
+
+
