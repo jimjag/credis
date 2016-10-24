@@ -1,6 +1,7 @@
-Credis (http://code.google.com/p/credis) is a client library in 
-plain C written by Jonas Romfelt (jonas at romfelt dot se) for 
-communicating with Redis (http://code.google.com/p/redis) servers. 
+Credis (https://github.com/jimjag/credis) is a fork/continuation of
+the original Credis (http://code.google.com/p/credis) code,  which
+was a client library in plain C written by Jonas Romfelt (jonas at romfelt dot se)
+for communicating with Redis (http://code.google.com/p/redis) servers. 
 Redis is a high performance key-value database, refer to Redis 
 project page for more information.
 
