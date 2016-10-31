@@ -711,22 +711,19 @@ void credis_close(REDIS rhnd)
 
 /* Requests Redis server information and tries to fill handle with server version 
  * information */ 
+#DEFINE RV_FIELD "redis_version:"
 static int cr_getredisversion(REDIS rhnd)
 {
-  /* We can receive 2 version formats: x.yz and x.y.z, where x.yz was only used prior 
-   * first 1.1.0 release(?), e.g. stable releases 1.02 and 1.2.6 */
-  /* TODO check returned error string, "-ERR operation not permitted", to detect if 
-   * server require password? */
   if (cr_sendfandreceive(rhnd, CR_BULK, "INFO\r\n") == 0) {
-    int items = sscanf(rhnd->reply.bulk,
-                       "redis_version:%d.%d.%d\r\n",
-                       &(rhnd->version.major),
-                       &(rhnd->version.minor),
-                       &(rhnd->version.patch));
-    if (items == 2) {
-      rhnd->version.patch = rhnd->version.minor;
-      rhnd->version.minor = 0;
-    }
+    char *p, *eptr;
+
+    p = strstr(rhnd->reply.bulk, RV_FIELD);
+    rhnd->version.major = strtol(p + sizeof(RV_FIELD) - 1, &eptr, 10);
+    p = eptr + 1;
+    rhnd->version.minor = strtol(p, &eptr, 10);
+    p = eptr + 1;
+    rhnd->version.patch = strtol(p, &eptr, 10);
+
     DEBUG("Connected to Redis version: %d.%d.%d\n", 
           rhnd->version.major, rhnd->version.minor, rhnd->version.patch);
 
