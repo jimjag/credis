@@ -711,7 +711,7 @@ void credis_close(REDIS rhnd)
 
 /* Requests Redis server information and tries to fill handle with server version 
  * information */ 
-#DEFINE RV_FIELD "redis_version:"
+#define RV_FIELD "redis_version:"
 static int cr_getredisversion(REDIS rhnd)
 {
   if (cr_sendfandreceive(rhnd, CR_BULK, "INFO\r\n") == 0) {
