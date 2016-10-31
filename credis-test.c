@@ -431,19 +431,6 @@ int test_suite2(void)
 
 #if 0
 
-
-  TEST_BEGIN("");
-  EXPECT_EQ(, 0);
-  TEST_DONE();
-
-  TEST_BEGIN("");
-  EXPECT_EQ(, 0);
-  TEST_DONE();
-
-  TEST_BEGIN("");
-  EXPECT_EQ(, 0);
-  TEST_DONE();
-
   printf("Adding 200 items to list\n");
   for (i = 0; i < 200; i++) {
     char str[100];
@@ -501,7 +488,11 @@ int main(int argc, char **argv) {
   int rc, keyc=5, i;
   double score1, score2;
 
-  return test_suite2();
+  printf("Testing a number of credis functions. To perform a simplistic set-command\n"\
+         "benchmark, run: `%s <num>' where <num> is the number\n"\
+         "of set-commands to send.\n\n", argv[0]);
+
+  test_suite2();
 
   redis = credis_connect(NULL, 0, 10000);
   if (redis == NULL) {
@@ -521,17 +512,8 @@ int main(int argc, char **argv) {
     }
     t = timer(0);
     printf("done! Took %.3f seconds, that is %ld commands/second\n", ((float)t)/1000, (num*1000)/t);
-    exit(0);
   }
 
-  printf("Testing a number of credis functions. To perform a simplistic set-command\n"\
-         "benchmark, run: `%s <num>' where <num> is the number\n"\
-         "of set-commands to send.\n\n", argv[0]);
-
-
-
-
-#if 0
   printf("\n\n************* misc info ************************************ \n");
 
   rc = credis_ping(redis);
@@ -635,7 +617,6 @@ int main(int argc, char **argv) {
 
   rc = credis_srem(redis, "fruits", "orange");
   printf("srem returned: %d\n", rc);
-#endif
 
   printf("\n\n************* lists ************************************ \n");
 
