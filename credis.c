@@ -1801,6 +1801,21 @@ int credis_zunionstore(REDIS rhnd, const char *destkey, int keyc, const char **k
   return cr_zstore(rhnd, 0, destkey, keyc, keyv, weightv, aggregate);
 }
 
+/*
+ * This is for Redis < 2.4 (only 1 field)
+ */
+int credis_hdel(REDIS rhnd, const char *key, const char *field)
+{
+  int rc;
+
+  rc = cr_sendfandreceive(rhnd, CR_INT, "HDEL %s %s\r\n", key, field);
+
+  if (rc != 0)
+    return -1; /* Error */
+  else
+    return rhnd->reply.integer;
+}
+
 int credis_hset(REDIS rhnd, const char *key, const char *field, const char *value)
 {
   int rc;
@@ -1812,10 +1827,10 @@ int credis_hset(REDIS rhnd, const char *key, const char *field, const char *valu
     rc = cr_sendfandreceive(rhnd, CR_INT, "HSET %s %s %zu\r\n%s\r\n", 
 			    key, field, strlen(value), value);
 
-  if (rc == 0 && rhnd->reply.integer == 0)
-    rc = -1;
-
-  return rc;
+  if (rc != 0)
+    return -1; /* Error */
+  else
+    return rhnd->reply.integer; /* 1-> new value 0->Modified value */
 }
 
 int credis_hget(REDIS rhnd, const char *key, const char *field, char **value)

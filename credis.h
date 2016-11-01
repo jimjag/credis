@@ -406,6 +406,10 @@ int credis_zunionstore(REDIS rhnd, const char *destkey, int keyc, const char **k
  * Commands operating on hashes
  */
 
+/* returns the number of fields that were removed from the hash, not including
+ * specified but non existing fields. -1 if error */
+int credis_hdel(REDIS rhnd, const char *key, const char *field);
+
 /* 1 is returned if the field already exists and its value is updated, 0 is 
  * returned if the field is created */
 int credis_hset(REDIS rhnd, const char *key, const char *field, const char *value);
