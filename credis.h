@@ -189,6 +189,9 @@ int credis_expire(REDIS rhnd, const char *key, int secs);
  * have expire set */
 int credis_ttl(REDIS rhnd, const char *key);
 
+/* returns -1 if key does not exists or does not have expire set */
+int credis_persist(REDIS rhnd, const char *key);
+
 int credis_select(REDIS rhnd, int index);
 
 /* returns -1 if the key was not moved; already present at target 
@@ -428,12 +431,17 @@ int credis_hlen(REDIS rhnd, const char *key);
  * of fields stored in `fieldv'. */
 int credis_hmget(REDIS rhnd, const char *key, int fieldc, const char **fieldv, char ***valv);
 
+int credis_hmset(REDIS rhnd, const char *key, int fieldc, const char **fieldv, const char **valv);
+
+/* if `new_val' is not NULL it will return the value after the increment was performed */
+int credis_hincrby(REDIS rhnd, const char *key, const char *field, int incr_val, int *new_val);
+
+/* returns number of values returned in vector `valv'. 0 is returned if `key'
+ * is empty or does not exist */
+int credis_hvals(REDIS rhnd, const char *key, char ***valv);
+
 /* TODO
- * HMSET key field1 value1 ... fieldN valueN Set the hash fields to their respective values.
- * HINCRBY key field integer Increment the integer value of the hash at _key_ on _field_ with _integer_.
  * HEXISTS key field Test for existence of a specified field in a hash
- * HDEL key field Remove the specified field from a hash
- * HVALS key Return all the values in a hash.
  * HGETALL key Return all the fields and associated values in a hash.
  */
 

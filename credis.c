@@ -1200,6 +1200,16 @@ int credis_ttl(REDIS rhnd, const char *key)
   return rc;
 }
 
+int credis_persist(REDIS rhnd, const char *key)
+{
+  int rc = cr_sendfandreceive(rhnd, CR_INT, "PERSIST %s\r\n", key);
+
+  if (rc == 0 && rhnd->reply.integer == 0)
+    rc = -1;
+
+  return rc;
+}
+
 static int cr_push(REDIS rhnd, int left, const char *key, const char *val)
 {
   int rc;
@@ -1898,6 +1908,50 @@ int credis_hmget(REDIS rhnd, const char *key, int fieldc, const char **fieldv, c
   return rc;
 }
 
+int credis_hmset(REDIS rhnd, const char *key, int fieldc, const char **fieldv, const char **valv)
+{
+  cr_buffer *buf = &(rhnd->buf);
+  int rc, i;
+
+  buf->len = 0;
+
+  /* using the new unified request protocol */
+  rc = cr_appendstrf(buf, "*%i\r\n$5\r\nHMSET\r\n$%zu\r\n%s\r\n", (2 * fieldc) + 2, strlen(key), key);
+  if (rc != 0)
+    return rc;
+
+  /* add fields and values */
+  for (i = 0; i < fieldc; i++) {
+    if ((rc = cr_appendstrf(buf, "$%zu\r\n%s\r\n$%zu\r\n%s\r\n", strlen(fieldv[i]), fieldv[i], strlen(valv[i]), valv[i])) != 0)
+      return rc;
+  }
+
+  return cr_sendandreceive(rhnd, CR_INLINE);
+}
+
+int credis_hincrby(REDIS rhnd, const char *key, const char *field, int incr_val, int *new_val)
+{
+  int rc = 0;
+  rc = cr_sendfandreceive(rhnd, CR_INT, "HINCRBY %s %s %d\r\n",
+                            key, field, incr_val);
+
+  if (rc == 0 && new_val != NULL)
+    *new_val = rhnd->reply.integer;
+
+  return rc;
+}
+
+int credis_hvals(REDIS rhnd, const char *key, char ***valv)
+{
+  int rc = cr_sendfandreceive(rhnd, CR_MULTIBULK, "HVALS %s\r\n", key);
+
+  if (rc == 0) {
+    rc = rhnd->reply.multibulk.len;
+    *valv = rhnd->reply.multibulk.bulks;
+  }
+
+  return rc;
+}
 
 static void cr_freemessage(cr_message *msg)
 {
