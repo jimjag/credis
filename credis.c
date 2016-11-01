@@ -94,14 +94,14 @@ typedef struct _cr_buffer {
     int idx;
     int len;
     int size;
-}          cr_buffer;
+} cr_buffer;
 
 typedef struct _cr_multibulk {
     char **bulks;
     int *idxs;
     int size;
     int len;
-}             cr_multibulk;
+} cr_multibulk;
 
 typedef struct _cr_reply {
     char type;
@@ -109,14 +109,14 @@ typedef struct _cr_reply {
     char *line;
     char *bulk;
     cr_multibulk multibulk;
-}         cr_reply;
+} cr_reply;
 
 typedef struct _cr_message {
     char *pattern;
     char *channel;
     char *message;
     struct _cr_message *next;
-}           cr_message;
+} cr_message;
 
 typedef struct _cr_redis {
     struct {
@@ -125,12 +125,12 @@ typedef struct _cr_redis {
 	int patch;
 	int number;		/* holds a version number created by
 				 * CR_VERSION() */
-    }      version;
+    } version;
     struct {
 	cr_message *head;
 	cr_message *tail;
 	cr_message *msg;
-    }      pubsub;
+    } pubsub;
     int fd;
     char *ip;
     int port;
@@ -138,7 +138,7 @@ typedef struct _cr_redis {
     cr_buffer buf;
     cr_reply reply;
     int error;
-}         cr_redis;
+} cr_redis;
 
 static void cr_freeallmessages(REDIS rhnd);
 
